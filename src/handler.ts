@@ -147,7 +147,7 @@ async function soundcloudWaveform(value: unknown, fetcher: Fetcher): Promise<str
       return chunk.reduce((sum, sample) => sum + sample, 0) / chunk.length;
     });
     const low = Math.min(...levels), range = Math.max(...levels) - low || 1;
-    return levels.map(level => "▁▂▃▄▅▆▇█"[Math.round((level - low) / range * 7)]).join("");
+    return levels.map(level => "─▪▮"[Math.round((level - low) / range * 2)]).join("");
   } catch { return ""; }
 }
 
