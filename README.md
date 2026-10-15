@@ -14,10 +14,13 @@ X and Instagram use Discord post cards with author avatars, linked quotes/replie
 
 Use `?media=2` to select media or `?direct=1` for its URL. Instagram's `img_index` and X's `/photo/2` or `/video/2` work too. Successful metadata is cached for five minutes; errors are not cached.
 
+Each warm server instance shares upstream metadata across HTML, oEmbed, Discord status requests, and media selections. Concurrent requests for the same post share one fetch. The cache retains at most 128 posts and 2 MiB of serialized metadata; response cache headers use the remaining freshness so CDN caching does not extend the five-minute window. This needs no database or cache service, and cold instances fetch normally.
+
 ```sh
 bun install
 bun dev          # PORT defaults to 3000
 bun run check
+bun test
 ```
 
 Deploy with `vercel` or import the repo using Vercel's Bun preset, then connect `fx.purduehackers.com`. No build step or secrets. The domain must be publicly accessible to chat crawlers.
