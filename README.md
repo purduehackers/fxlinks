@@ -16,7 +16,6 @@ Use `?media=2` to select media or `?direct=1` for its URL. Instagram's `img_inde
 bun install
 bun dev          # PORT defaults to 3000
 bun run check
-bun test
 ```
 
 Deploy with `vercel` or import the repo using Vercel's Bun preset, then connect `fx.purduehackers.com`. No build step or secrets. The domain must be publicly accessible to chat crawlers.
