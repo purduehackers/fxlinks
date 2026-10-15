@@ -1,20 +1,31 @@
+import { embed, type Post } from "./embed.ts";
+
 export type Fetcher = (url: string | URL, init?: RequestInit) => Promise<Response>;
 type Data = Record<string, any>;
-type Media = { image?: string; video?: string; width?: number; height?: number };
 class HttpError extends Error {
   constructor(message: string, public status = 502) { super(message); }
 }
 
 const sources = {
-  t: { name: "X", origin: "https://x.com", cdns: ["twimg.com"],
+  t: { name: "X", origin: "https://x.com", color: "#1d9bf0", cdns: ["twimg.com"],
     path: /^\/(?:\w{1,15}|i\/web)\/status\/(\d{1,25})(?:\/(?:photo|video)\/(\d+))?\/?$/ },
-  i: { name: "Instagram", origin: "https://www.instagram.com", cdns: ["cdninstagram.com", "fbcdn.net"],
+  i: { name: "Instagram", origin: "https://www.instagram.com", color: "#e1306c", cdns: ["cdninstagram.com", "fbcdn.net"],
     path: /^\/(?:[\w.]+\/)?(?:p|reel|reels|tv)\/([\w-]{5,32})(?:\/(\d+))?\/?$/ },
-  s: { name: "SoundCloud", origin: "https://soundcloud.com", cdns: ["sndcdn.com"],
+  s: { name: "SoundCloud", origin: "https://soundcloud.com", color: "#ff5500", cdns: ["sndcdn.com"],
     path: /^\/(?:[\w-]{1,200}\/(?:sets\/)?[\w-]{1,200}|[a-zA-Z0-9]{4,100})\/?$/ },
 };
 const list = (value: unknown): Data[] => Array.isArray(value) ? value.filter(v => v && typeof v === "object") : [];
 const dimension = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+function count(value: unknown): number | undefined {
+  if (typeof value === "string" && /^\d+$/.test(value)) value = Number(value);
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return Math.floor(value);
+}
+const excerpt = (value: string, limit = 3000) => value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+function date(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return;
+  const time = new Date(typeof value === "number" ? value * 1000 : value);
+  if (Number.isFinite(time.getTime())) return time.toISOString();
+}
 
 function mediaURL(value: unknown, cdns: string[]): string | undefined {
   try {
@@ -71,7 +82,7 @@ function instagramData(html: string, id: string): Data | undefined {
   }
 }
 
-function instagramPost(data: Data) {
+function instagramPost(data: Data, original: string): Post {
   const user = data.owner ?? data.user;
   if (typeof user?.username !== "string" || !user.username) throw new HttpError("Invalid Instagram response.");
   const media = list(data.edge_sidecar_to_children?.edges?.map((e: Data) => e?.node) ?? data.carousel_media ?? [data]).slice(0, 20).map(item => {
@@ -80,12 +91,80 @@ function instagramPost(data: Data) {
     const video = mediaURL(item.video_url || bestMedia(item.video_versions, sources.i.cdns)?.url, sources.i.cdns);
     const isVideo = item.is_video === true || item.media_type === 2 || /Video/.test(item.__typename) || !!item.video_url || !!video;
     if (isVideo && !video || !isVideo && !image) throw new HttpError("Instagram media unavailable or requires login.");
-    return { image, video, width: dimension(item.dimensions?.width ?? item.original_width ?? imageData?.width),
+    return { image, video, alt: item.accessibility_caption, width: dimension(item.dimensions?.width ?? item.original_width ?? imageData?.width),
       height: dimension(item.dimensions?.height ?? item.original_height ?? imageData?.height) };
   });
   if (!media.length) throw new HttpError("Instagram returned no media.");
-  return { author: `${user.full_name || user.username} (@${user.username})`,
-    text: data.edge_media_to_caption?.edges?.[0]?.node?.text ?? data.caption?.text ?? "", media };
+  return { author: { name: user.full_name || user.username, handle: user.username,
+      url: `${sources.i.origin}/${encodeURIComponent(user.username)}/`, avatar: mediaURL(user.profile_pic_url, sources.i.cdns) },
+    text: data.edge_media_to_caption?.edges?.[0]?.node?.text ?? data.caption?.text ?? "", media, original,
+    date: date(data.taken_at_timestamp ?? data.taken_at),
+    stats: { likes: count(data.edge_liked_by?.count ?? data.edge_media_preview_like?.count ?? data.like_count),
+      replies: count(data.edge_media_to_comment?.count ?? data.edge_media_to_parent_comment?.count ?? data.comment_count),
+      views: count(data.video_view_count ?? data.play_count ?? data.video_play_count) } };
+}
+
+function twitterPost(data: Data, quoted = false): Post {
+  if (!data.user?.screen_name || typeof data.text !== "string" || !/^\d+$/.test(data.id_str)) throw new HttpError("Invalid X response.");
+  const user = data.user;
+  let text: string = data.note_tweet?.text || data.text;
+  for (const entity of list(data.entities?.urls)) {
+    if (entity.url && entity.expanded_url) text = text.replaceAll(entity.url, entity.expanded_url);
+  }
+  for (const entity of list(data.entities?.media)) {
+    if (entity.url) text = text.replaceAll(entity.url, "");
+  }
+  const quote = !quoted && data.quoted_tweet?.user ? twitterPost(data.quoted_tweet, true) : undefined;
+  if (quote) text = text.replace(new RegExp(`https?://(?:www\\.)?(?:twitter|x)\\.com/\\w+/status/${data.quoted_tweet.id_str}\\b\\S*`, "g"), "");
+  text = text.replace(/&(amp|lt|gt);/g, (_, key: string) => ({ amp: "&", lt: "<", gt: ">" })[key]!);
+  const media = list(data.mediaDetails).slice(0, 20).map(item => {
+    const image = mediaURL(item.media_url_https, sources.t.cdns);
+    const video = mediaURL(bestMedia(item.video_info?.variants, sources.t.cdns, "video/mp4")?.url, sources.t.cdns);
+    const isVideo = ["video", "animated_gif"].includes(item.type);
+    if (isVideo && !video || !isVideo && (item.type !== "photo" || !image)) throw new HttpError("Media unavailable.");
+    return { image, video, alt: item.ext_alt_text, width: dimension(item.original_info?.width), height: dimension(item.original_info?.height) };
+  });
+  const profile = `${sources.t.origin}/${encodeURIComponent(user.screen_name)}`;
+  return { author: { name: user.name || user.screen_name, handle: user.screen_name, url: profile,
+      avatar: mediaURL(user.profile_image_url_https, sources.t.cdns) },
+    text: excerpt(text.trim(), quoted ? 1500 : 3000), original: `${profile}/status/${data.id_str}`, date: date(data.created_at),
+    quote, replyingTo: data.in_reply_to_screen_name, media: media.length ? media : quote?.media ?? [],
+    stats: { likes: count(data.favorite_count), replies: count(data.conversation_count ?? data.reply_count),
+      reposts: count(data.retweet_count), quotes: count(data.quote_count), views: count(data.view_count ?? data.views?.count),
+      plays: count(data.video?.viewCount) } };
+}
+
+async function soundcloudPost(original: URL, fetcher: Fetcher): Promise<Post> {
+  try {
+    const html = await read(original, fetcher);
+    const hydration = html.match(/window\.__sc_hydration\s*=\s*([\s\S]*?);\s*<\/script>/)?.[1];
+    const data = list(JSON.parse(hydration ?? "[]")).find(item => ["sound", "playlist"].includes(item.hydratable))?.data;
+    if (typeof data?.title !== "string" || !data.title || typeof data.user?.username !== "string" ||
+        typeof data.user.permalink !== "string") throw new HttpError("Invalid SoundCloud response.");
+    const duration = dimension(data.full_duration ?? data.duration);
+    let length: string | undefined;
+    if (duration) {
+      const seconds = Math.floor(duration / 1000);
+      const parts = [Math.floor(seconds / 60) % 60, seconds % 60];
+      if (seconds >= 3600) parts.unshift(Math.floor(seconds / 3600));
+      length = parts.map((part, index) => index ? String(part).padStart(2, "0") : part).join(":");
+    }
+    const image = mediaURL(data.artwork_url || list(data.tracks).find(track => track.artwork_url)?.artwork_url || data.user.avatar_url, sources.s.cdns)
+      ?.replace(/-large\.(jpg|png|webp)$/, "-t500x500.$1");
+    return { title: data.title, text: excerpt(data.description || "", 600), original: original.href,
+      author: { name: data.user.username, handle: data.user.permalink, url: `${sources.s.origin}/${encodeURIComponent(data.user.permalink)}`,
+        avatar: mediaURL(data.user.avatar_url, sources.s.cdns) },
+      media: image ? [{ image }] : [], date: date(data.display_date ?? data.created_at),
+      details: [length && `⏱ ${length}`, data.kind === "playlist" && count(data.track_count) !== undefined && `${data.track_count} tracks`, data.genre].filter(Boolean).join(" · "),
+      stats: { likes: count(data.likes_count), replies: count(data.comment_count), reposts: count(data.reposts_count), plays: count(data.playback_count) } };
+  } catch {
+    const data = JSON.parse(await read(`https://soundcloud.com/oembed?format=json&url=${encodeURIComponent(original.href)}`, fetcher));
+    if (typeof data?.title !== "string" || !data.title || typeof data.author_name !== "string" || !data.author_name) throw new HttpError("Invalid SoundCloud response.");
+    const image = mediaURL(data.thumbnail_url, sources.s.cdns);
+    const handle = original.pathname.split("/")[1]!;
+    return { title: data.title, text: `By ${data.author_name}`, original: original.href,
+      author: { name: data.author_name, handle, url: `${sources.s.origin}/${handle}` }, media: image ? [{ image }] : [], stats: {} };
+  }
 }
 
 async function loadPost(url: URL, fetcher: Fetcher) {
@@ -99,7 +178,7 @@ async function loadPost(url: URL, fetcher: Fetcher) {
   const index = Number(selection ?? 1) - 1;
   let original = new URL(source.origin + path);
   if (match[2]) original.pathname = path.replace(/\/(?:(?:photo|video)\/)?\d+$/, "");
-  let title: string, author: string, text: string, media: Media[];
+  let post: Post;
 
   if (key === "s") {
     if (!path.slice(1).includes("/")) {
@@ -120,48 +199,31 @@ async function loadPost(url: URL, fetcher: Fetcher) {
       }
       if (original.hostname === "on.soundcloud.com") throw new HttpError("Could not resolve SoundCloud link.");
     }
-    const data = JSON.parse(await read(`https://soundcloud.com/oembed?format=json&url=${encodeURIComponent(original.href)}`, fetcher));
-    if (typeof data?.title !== "string" || !data.title || typeof data.author_name !== "string" || !data.author_name) throw new HttpError("Invalid SoundCloud response.");
-    title = data.title;
-    author = data.author_name;
-    text = `By ${author}`;
-    const image = mediaURL(data.thumbnail_url, source.cdns);
-    media = image ? [{ image }] : [];
+    post = await soundcloudPost(original, fetcher);
   } else if (key === "t") {
     const token = (Number(match[1]) / 1e15 * Math.PI).toString(36).replace(/[0.]/g, "");
     const data = JSON.parse(await read(`https://cdn.syndication.twimg.com/tweet-result?id=${match[1]}&lang=en&token=${token}`, fetcher));
     if (!data || data.__typename === "TweetTombstone" || !Object.keys(data).length) throw new HttpError("Post unavailable.", 404);
-    if (data.id_str !== match[1] || !data.user?.screen_name || typeof data.text !== "string") throw new HttpError("Invalid X response.");
-    author = `${data.user.name || data.user.screen_name} (@${data.user.screen_name})`;
-    title = author;
-    text = data.note_tweet?.text || data.text;
-    for (const entity of list(data.entities?.urls)) {
-      if (entity.url && entity.expanded_url) text = text.replaceAll(entity.url, entity.expanded_url);
-    }
-    for (const entity of list(data.entities?.media)) {
-      if (entity.url) text = text.replaceAll(entity.url, "");
-    }
-    media = list(data.mediaDetails).slice(0, 20).map(item => {
-      const image = mediaURL(item.media_url_https, source.cdns);
-      const video = mediaURL(bestMedia(item.video_info?.variants, source.cdns, "video/mp4")?.url, source.cdns);
-      const isVideo = ["video", "animated_gif"].includes(item.type);
-      if (isVideo && !video || !isVideo && (item.type !== "photo" || !image)) throw new HttpError("Media unavailable.");
-      return { image, video, width: dimension(item.original_info?.width), height: dimension(item.original_info?.height) };
-    });
+    if (data.id_str !== match[1]) throw new HttpError("Invalid X response.");
+    post = twitterPost(data);
   } else {
-    let post: ReturnType<typeof instagramPost> | undefined, failure: unknown;
+    let found: Post | undefined, failure: unknown;
     for (const suffix of ["embed/captioned/", ""]) {
       try {
         const data = instagramData(await read(`https://www.instagram.com/p/${match[1]}/${suffix}`, fetcher), match[1]!);
-        if (data) { post = instagramPost(data); break; }
+        if (data) { found = instagramPost(data, original.href); break; }
       } catch (error) { failure = error; }
     }
-    if (!post) throw failure ?? new HttpError("Instagram post unavailable.");
-    ({ author, text, media } = post);
-    title = author;
+    if (!found) throw failure ?? new HttpError("Instagram post unavailable.");
+    post = found;
   }
-  if ((selection !== undefined || url.searchParams.get("direct") === "1") && !media[index]) throw new HttpError("Media not found.", 404);
-  return { title, author, text: text.trim().slice(0, 4000), media: media[index], original, source };
+  if ((selection !== undefined || url.searchParams.get("direct") === "1") && !post.media[index]) throw new HttpError("Media not found.", 404);
+  if (selection !== undefined) post.media = [post.media[index]!];
+  post.text = excerpt(post.text.trim());
+  const pathWithSelection = url.pathname + (selection === undefined ? "" : `?media=${selection}`);
+  // Discord's Mastodon discovery requires a numeric ID; encode the local route without server-side state.
+  const id = BigInt(`0x${Buffer.from(pathWithSelection).toString("hex")}`).toString();
+  return { post, source, id };
 }
 
 export async function handle(request: Request, fetcher: Fetcher = fetch): Promise<Response> {
@@ -174,45 +236,32 @@ export async function handle(request: Request, fetcher: Fetcher = fetch): Promis
     }
     const url = new URL(request.url);
     const isOembed = url.pathname === "/oembed";
+    const activity = /^\/(?:api\/v1\/statuses|users\/[\w.-]+\/statuses)\/(\d{1,2500})$/.exec(url.pathname);
     let target = url;
     if (isOembed) {
       try { target = new URL(url.searchParams.get("url") ?? ""); } catch { throw new HttpError("Invalid embed URL.", 400); }
       if (target.origin !== url.origin) throw new HttpError("Invalid embed origin.", 400);
     }
-    const { title, author, text, media, original, source } = await loadPost(target, fetcher);
-    if (!isOembed && url.searchParams.get("direct") === "1") {
+    if (activity) {
+      const hex = BigInt(activity[1]!).toString(16);
+      const path = Buffer.from(hex.padStart(hex.length + hex.length % 2, "0"), "hex").toString();
+      if (!/^\/[tis]\//.test(path)) throw new HttpError("Invalid status ID.", 400);
+      target = new URL(path, url.origin);
+    }
+    const { post, source, id } = await loadPost(target, fetcher);
+    const media = post.media[0];
+    if (!isOembed && !activity && url.searchParams.get("direct") === "1") {
       status = 302;
       headers.set("location", (media?.video || media?.image)!);
     } else {
       headers.set("cache-control", "public, max-age=0, s-maxage=300, stale-while-revalidate=30");
-      if (isOembed) {
+      const rendered = embed(post, source, target, id);
+      if (isOembed || activity) {
         headers.set("content-type", "application/json");
-        body = JSON.stringify({ version: "1.0", type: "link", title: source.name === "SoundCloud" ? title : text, author_name: author,
-          author_url: original.href, provider_name: `${source.name} · EmbedFix`, provider_url: url.origin });
+        body = JSON.stringify(activity ? rendered.activity : rendered.oembed);
       } else {
         headers.set("content-type", "text/html; charset=utf-8");
-        let type = "article", card = "summary";
-        if (media?.image) card = "summary_large_image";
-        if (media?.video) { type = "video.other"; card = "player"; }
-        if (source.name === "SoundCloud") type = original.pathname.includes("/sets/") ? "music.playlist" : "music.song";
-        const tags: Record<string, string | number | undefined> = {
-          "og:site_name": `${source.name} · EmbedFix`, "og:url": original.href, "og:type": type,
-          "og:title": title, "og:description": text, "twitter:title": title, "twitter:description": text, "twitter:card": card,
-          "og:image": media?.image, "twitter:image": media?.image,
-          "og:image:width": media?.image ? media.width : undefined, "og:image:height": media?.image ? media.height : undefined,
-        };
-        if (media?.video) Object.assign(tags, {
-          "og:video": media.video, "og:video:secure_url": media.video, "og:video:type": "video/mp4",
-          "og:video:width": media.width, "og:video:height": media.height,
-          "twitter:player:stream": media.video, "twitter:player:stream:content_type": "video/mp4",
-          "twitter:player:width": media.width, "twitter:player:height": media.height,
-        });
-        const meta = Object.entries(tags).filter(([, value]) => value !== undefined).map(([name, value]) =>
-          `<meta ${name.startsWith("twitter:") ? "name" : "property"}="${name}" content="${Bun.escapeHTML(String(value))}">`).join("\n");
-        body = `<!doctype html><html><head><meta charset="utf-8"><meta name="robots" content="noindex"><title>${Bun.escapeHTML(title)}</title>
-${meta}<link rel="canonical" href="${Bun.escapeHTML(original.href)}">
-<link rel="alternate" type="application/json+oembed" href="${Bun.escapeHTML(`${url.origin}/oembed?url=${encodeURIComponent(url.href)}`)}"></head>
-<body><a href="${Bun.escapeHTML(original.href)}">Open original</a><script>location.replace(document.querySelector('link[rel="canonical"]').href)</script></body></html>`;
+        body = rendered.html;
       }
     }
   } catch (error) {
