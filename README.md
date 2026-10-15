@@ -10,7 +10,7 @@ Dependency-free Bun embed server. Fetches directly from X, Instagram, and SoundC
 
 Keep the remaining path. Crawlers get metadata; browsers open the original. `/` returns 404.
 
-Discord gets native post cards with author avatars, linked quotes/replies, media galleries, and dates when available. Other clients get Open Graph cards. X shows likes and replies; Instagram adds reel views; SoundCloud shows artwork, duration, genre, plays, hearts, comments, and reposts. Only counts exposed by the source appear: X's public endpoint usually omits post views and repost counts.
+X and Instagram use Discord post cards with author avatars, linked quotes/replies, media galleries, and dates when available. SoundCloud uses music cards with the artist's name, artwork, a compact waveform from the track's samples, duration, genre, plays, hearts, comments, and reposts. Other clients get Open Graph cards. Only counts exposed by the source appear: X's public endpoint usually omits post views and repost counts. Waveforms fall back to a plain duration if unavailable.
 
 Use `?media=2` to select media or `?direct=1` for its URL. Instagram's `img_index` and X's `/photo/2` or `/video/2` work too. Successful metadata is cached for five minutes; errors are not cached.
 

@@ -40,8 +40,8 @@ function bestMedia(items: unknown, cdns: string[], mime?: string): Data | undefi
     .sort((a, b) => (b.bitrate ?? b.width ?? 0) - (a.bitrate ?? a.width ?? 0))[0];
 }
 
-async function read(url: string | URL, fetcher: Fetcher): Promise<string> {
-  const response = await fetcher(url, { redirect: "error", signal: AbortSignal.timeout(10_000),
+async function read(url: string | URL, fetcher: Fetcher, timeout = 10_000): Promise<string> {
+  const response = await fetcher(url, { redirect: "error", signal: AbortSignal.timeout(timeout),
     headers: { "user-agent": "Mozilla/5.0", "accept-language": "en-US,en;q=0.9" } });
   if (!response.ok) {
     await response.body?.cancel();
@@ -134,6 +134,22 @@ function twitterPost(data: Data, quoted = false): Post {
       plays: count(data.video?.viewCount) } };
 }
 
+async function soundcloudWaveform(value: unknown, fetcher: Fetcher): Promise<string> {
+  const url = mediaURL(value, sources.s.cdns);
+  if (!url) return "";
+  try {
+    const { samples } = JSON.parse(await read(url, fetcher, 2000));
+    if (!Array.isArray(samples) || samples.length < 24 ||
+        !samples.every(v => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1_000_000)) return "";
+    const levels = Array.from({ length: 24 }, (_, index) => {
+      const chunk = samples.slice(Math.floor(index * samples.length / 24), Math.floor((index + 1) * samples.length / 24));
+      return chunk.reduce((sum, sample) => sum + sample, 0) / chunk.length;
+    });
+    const low = Math.min(...levels), range = Math.max(...levels) - low || 1;
+    return levels.map(level => "▁▂▃▄▅▆▇█"[Math.round((level - low) / range * 7)]).join("");
+  } catch { return ""; }
+}
+
 async function soundcloudPost(original: URL, fetcher: Fetcher): Promise<Post> {
   try {
     const html = await read(original, fetcher);
@@ -149,13 +165,14 @@ async function soundcloudPost(original: URL, fetcher: Fetcher): Promise<Post> {
       if (seconds >= 3600) parts.unshift(Math.floor(seconds / 3600));
       length = parts.map((part, index) => index ? String(part).padStart(2, "0") : part).join(":");
     }
+    const waveform = length ? await soundcloudWaveform(data.waveform_url, fetcher) : "";
     const image = mediaURL(data.artwork_url || list(data.tracks).find(track => track.artwork_url)?.artwork_url || data.user.avatar_url, sources.s.cdns)
       ?.replace(/-large\.(jpg|png|webp)$/, "-t500x500.$1");
     return { title: data.title, text: excerpt(data.description || "", 600), original: original.href,
       author: { name: data.user.username, handle: data.user.permalink, url: `${sources.s.origin}/${encodeURIComponent(data.user.permalink)}`,
         avatar: mediaURL(data.user.avatar_url, sources.s.cdns) },
       media: image ? [{ image }] : [], date: date(data.display_date ?? data.created_at),
-      details: [length && `⏱ ${length}`, data.kind === "playlist" && count(data.track_count) !== undefined && `${data.track_count} tracks`, data.genre].filter(Boolean).join(" · "),
+      details: [length && ["▶", waveform, length].filter(Boolean).join(" "), data.kind === "playlist" && count(data.track_count) !== undefined && `${data.track_count} tracks`, data.genre].filter(Boolean).join(" · "),
       stats: { likes: count(data.likes_count), replies: count(data.comment_count), reposts: count(data.reposts_count), plays: count(data.playback_count) } };
   } catch {
     const data = JSON.parse(await read(`https://soundcloud.com/oembed?format=json&url=${encodeURIComponent(original.href)}`, fetcher));

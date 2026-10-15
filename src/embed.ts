@@ -26,12 +26,13 @@ function linkedText(text: string, source: Source): string {
 }
 
 export function embed(post: Post, source: Source, url: URL, id: string) {
-  const author = `${post.author.name} (@${post.author.handle})`;
+  const isSoundCloud = source.name === "SoundCloud";
+  const author = isSoundCloud ? post.author.name : `${post.author.name} (@${post.author.handle})`;
   const title = post.title || author;
   const stats = Object.entries(post.stats).filter(([, value]) => value !== undefined)
     .map(([key, value]) => `${icons[key as keyof typeof icons]} ${compact.format(value!)}`).join("   ");
   const quote = post.quote;
-  const description = [post.title && `By ${post.author.name}`, post.details, post.text, quote && `Quoting ${quote.author.name} (@${quote.author.handle})\n${quote.text}`, stats]
+  const description = [post.details, isSoundCloud && stats, post.text, quote && `Quoting ${quote.author.name} (@${quote.author.handle})\n${quote.text}`, !isSoundCloud && stats]
     .filter(Boolean).join("\n\n");
   let content = linkedText(post.text, source);
   if (post.details) content = `${escape(post.details)}<br><br>${content}`;
@@ -61,7 +62,7 @@ export function embed(post: Post, source: Source, url: URL, id: string) {
   let type = "article", card = "summary";
   if (media?.image) card = "summary_large_image";
   if (media?.video) { type = "video.other"; card = "player"; }
-  if (source.name === "SoundCloud") type = post.original.includes("/sets/") ? "music.playlist" : "music.song";
+  if (isSoundCloud) type = post.original.includes("/sets/") ? "music.playlist" : "music.song";
   const tags: Record<string, string | number | undefined> = {
     "og:site_name": source.name, "og:url": post.original, "og:type": type, "theme-color": source.color,
     "og:title": title, "og:description": description, "twitter:title": title, "twitter:description": description, "twitter:card": card,
@@ -80,7 +81,7 @@ export function embed(post: Post, source: Source, url: URL, id: string) {
   const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="robots" content="noindex"><title>${escape(title)}</title>
 ${meta}<link rel="canonical" href="${escape(post.original)}">
 <link rel="icon" href="${source.origin}/favicon.ico">
-<link rel="alternate" type="application/activity+json" href="${url.origin}/users/${encodeURIComponent(post.author.handle)}/statuses/${id}">
+${isSoundCloud ? "" : `<link rel="alternate" type="application/activity+json" href="${url.origin}/users/${encodeURIComponent(post.author.handle)}/statuses/${id}">`}
 <link rel="alternate" type="application/json+oembed" href="${escape(`${url.origin}/oembed?url=${encodeURIComponent(url.href)}`)}"></head>
 <body><a href="${escape(post.original)}">Open original</a><script>location.replace(document.querySelector('link[rel="canonical"]').href)</script></body></html>`;
   return { html, activity, oembed };
