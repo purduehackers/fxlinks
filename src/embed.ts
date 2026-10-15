@@ -33,7 +33,7 @@ export function embed(post: Post, source: Source, url: URL, id: string) {
     .map(([key, value]) => `${icons[key as keyof typeof icons]} ${compact.format(value!)}`).join("   ");
   const quote = post.quote;
   const description = [post.details, isSoundCloud && stats, post.text, quote && `Quoting ${quote.author.name} (@${quote.author.handle})\n${quote.text}`, !isSoundCloud && stats]
-    .filter(Boolean).join("\n\n");
+    .filter(Boolean).join(isSoundCloud ? "\n" : "\n\n");
   let content = linkedText(post.text, source);
   if (post.details) content = `${escape(post.details)}<br><br>${content}`;
   if (post.title) content = `<b><a href="${escape(post.original)}">${escape(post.title)}</a></b><br><br>${content}`;
@@ -60,13 +60,18 @@ export function embed(post: Post, source: Source, url: URL, id: string) {
     author_name: post.author.name, author_url: post.author.url, provider_name: source.name, provider_url: source.origin };
   const media = post.media[0];
   let type = "article", card = "summary";
+  let image = media?.image || post.author.avatar;
   if (media?.image) card = "summary_large_image";
   if (media?.video) { type = "video.other"; card = "player"; }
-  if (isSoundCloud) type = post.original.includes("/sets/") ? "music.playlist" : "music.song";
+  if (isSoundCloud) {
+    type = post.original.includes("/sets/") ? "music.playlist" : "music.song";
+    card = "summary";
+    image = image?.replace(/-t500x500\.(jpg|png|webp)$/, "-large.$1");
+  }
   const tags: Record<string, string | number | undefined> = {
     "og:site_name": source.name, "og:url": post.original, "og:type": type, "theme-color": source.color,
     "og:title": title, "og:description": description, "twitter:title": title, "twitter:description": description, "twitter:card": card,
-    "og:image": media?.image || post.author.avatar, "twitter:image": media?.image || post.author.avatar,
+    "og:image": image, "twitter:image": image,
     "og:image:width": media?.image ? media.width : undefined, "og:image:height": media?.image ? media.height : undefined,
     "article:published_time": post.date, "article:author": post.author.url,
   };

@@ -139,10 +139,11 @@ async function soundcloudWaveform(value: unknown, fetcher: Fetcher): Promise<str
   if (!url) return "";
   try {
     const { samples } = JSON.parse(await read(url, fetcher, 2000));
-    if (!Array.isArray(samples) || samples.length < 24 ||
+    const bars = 8;
+    if (!Array.isArray(samples) || samples.length < bars ||
         !samples.every(v => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1_000_000)) return "";
-    const levels = Array.from({ length: 24 }, (_, index) => {
-      const chunk = samples.slice(Math.floor(index * samples.length / 24), Math.floor((index + 1) * samples.length / 24));
+    const levels = Array.from({ length: bars }, (_, index) => {
+      const chunk = samples.slice(Math.floor(index * samples.length / bars), Math.floor((index + 1) * samples.length / bars));
       return chunk.reduce((sum, sample) => sum + sample, 0) / chunk.length;
     });
     const low = Math.min(...levels), range = Math.max(...levels) - low || 1;
@@ -168,7 +169,7 @@ async function soundcloudPost(original: URL, fetcher: Fetcher): Promise<Post> {
     const waveform = length ? await soundcloudWaveform(data.waveform_url, fetcher) : "";
     const image = mediaURL(data.artwork_url || list(data.tracks).find(track => track.artwork_url)?.artwork_url || data.user.avatar_url, sources.s.cdns)
       ?.replace(/-large\.(jpg|png|webp)$/, "-t500x500.$1");
-    return { title: data.title, text: excerpt(data.description || "", 600), original: original.href,
+    return { title: data.title, text: excerpt((data.description || "").trim().split(/\r?\n/, 1)[0]!, 140), original: original.href,
       author: { name: data.user.username, handle: data.user.permalink, url: `${sources.s.origin}/${encodeURIComponent(data.user.permalink)}`,
         avatar: mediaURL(data.user.avatar_url, sources.s.cdns) },
       media: image ? [{ image }] : [], date: date(data.display_date ?? data.created_at),
