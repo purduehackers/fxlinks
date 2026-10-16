@@ -1,4 +1,5 @@
 import { embed, type Post } from "./embed.ts";
+import { createPostCache } from "./cache.ts";
 
 export type Fetcher = (url: string | URL, init?: RequestInit) => Promise<Response>;
 type Data = Record<string, any>;
@@ -185,7 +186,7 @@ async function soundcloudPost(original: URL, fetcher: Fetcher): Promise<Post> {
   }
 }
 
-async function loadPost(url: URL, fetcher: Fetcher) {
+async function loadPost(url: URL, fetcher: Fetcher, cached: ReturnType<typeof createPostCache>) {
   const key = url.pathname[1] as keyof typeof sources;
   const source = sources[key];
   const path = url.pathname.slice(2).replace(/\/$/, "");
@@ -194,12 +195,30 @@ async function loadPost(url: URL, fetcher: Fetcher) {
   const selection = url.searchParams.get("media") ?? url.searchParams.get("img_index") ?? match[2];
   if (selection !== undefined && (!/^[1-9]\d*$/.test(selection) || Number(selection) > 20)) throw new HttpError("Invalid media number.", 400);
   const index = Number(selection ?? 1) - 1;
-  let original = new URL(source.origin + path);
+  const original = new URL(source.origin + path);
   if (match[2]) original.pathname = path.replace(/\/(?:(?:photo|video)\/)?\d+$/, "");
+  // X handles and Instagram route aliases identify the same upstream post.
+  const cacheKey = `${key}:${key === "s" ? path : match[1]}`;
+  const loaded = await cached(cacheKey, async () => {
+    const post = await fetchPost(key, match[1]!, original, fetcher);
+    return { ...post, text: excerpt(post.text.trim()) };
+  });
+  let post = loaded.post;
+  // Preserve this request's original Instagram URL rather than the first alias cached.
+  if (key === "i") post = { ...post, original: original.href };
+  if ((selection !== undefined || url.searchParams.get("direct") === "1") && !post.media[index]) throw new HttpError("Media not found.", 404);
+  if (selection !== undefined) post = { ...post, media: [post.media[index]!] };
+  const pathWithSelection = url.pathname + (selection === undefined ? "" : `?media=${selection}`);
+  // Discord's Mastodon discovery requires a numeric ID; encode the local route without server-side state.
+  const id = BigInt(`0x${Buffer.from(pathWithSelection).toString("hex")}`).toString();
+  return { post, source, id, expiresAt: loaded.expiresAt };
+}
+
+async function fetchPost(key: keyof typeof sources, id: string, original: URL, fetcher: Fetcher) {
   let post: Post;
 
   if (key === "s") {
-    if (!path.slice(1).includes("/")) {
+    if (!original.pathname.slice(1).includes("/")) {
       original.hostname = "on.soundcloud.com";
       const signal = AbortSignal.timeout(10_000);
       for (let hop = 0; hop < 4 && original.hostname === "on.soundcloud.com"; hop++) {
@@ -211,7 +230,7 @@ async function loadPost(url: URL, fetcher: Fetcher) {
         const host = next.hostname.replace(/^(www|m|mobile)\./, "");
         const short = !next.pathname.slice(1).replace(/\/$/, "").includes("/");
         if (!/^https?:$/.test(next.protocol) || next.username || next.password || next.port ||
-            !["soundcloud.com", "on.soundcloud.com"].includes(host) || !source.path.test(next.pathname) ||
+            !["soundcloud.com", "on.soundcloud.com"].includes(host) || !sources.s.path.test(next.pathname) ||
             short !== (host === "on.soundcloud.com")) throw new HttpError("Invalid SoundCloud redirect.");
         original = new URL(`https://${host}${next.pathname}`);
       }
@@ -219,74 +238,75 @@ async function loadPost(url: URL, fetcher: Fetcher) {
     }
     post = await soundcloudPost(original, fetcher);
   } else if (key === "t") {
-    const token = (Number(match[1]) / 1e15 * Math.PI).toString(36).replace(/[0.]/g, "");
-    const data = JSON.parse(await read(`https://cdn.syndication.twimg.com/tweet-result?id=${match[1]}&lang=en&token=${token}`, fetcher));
+    const token = (Number(id) / 1e15 * Math.PI).toString(36).replace(/[0.]/g, "");
+    const data = JSON.parse(await read(`https://cdn.syndication.twimg.com/tweet-result?id=${id}&lang=en&token=${token}`, fetcher));
     if (!data || data.__typename === "TweetTombstone" || !Object.keys(data).length) throw new HttpError("Post unavailable.", 404);
-    if (data.id_str !== match[1]) throw new HttpError("Invalid X response.");
+    if (data.id_str !== id) throw new HttpError("Invalid X response.");
     post = twitterPost(data);
   } else {
     let found: Post | undefined, failure: unknown;
     for (const suffix of ["embed/captioned/", ""]) {
       try {
-        const data = instagramData(await read(`https://www.instagram.com/p/${match[1]}/${suffix}`, fetcher), match[1]!);
+        const data = instagramData(await read(`https://www.instagram.com/p/${id}/${suffix}`, fetcher), id);
         if (data) { found = instagramPost(data, original.href); break; }
       } catch (error) { failure = error; }
     }
     if (!found) throw failure ?? new HttpError("Instagram post unavailable.");
     post = found;
   }
-  if ((selection !== undefined || url.searchParams.get("direct") === "1") && !post.media[index]) throw new HttpError("Media not found.", 404);
-  if (selection !== undefined) post.media = [post.media[index]!];
-  post.text = excerpt(post.text.trim());
-  const pathWithSelection = url.pathname + (selection === undefined ? "" : `?media=${selection}`);
-  // Discord's Mastodon discovery requires a numeric ID; encode the local route without server-side state.
-  const id = BigInt(`0x${Buffer.from(pathWithSelection).toString("hex")}`).toString();
-  return { post, source, id };
+  return post;
 }
 
-export async function handle(request: Request, fetcher: Fetcher = fetch): Promise<Response> {
-  const headers = new Headers({ "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer" });
-  let body = "", status = 200;
-  try {
-    if (!["GET", "HEAD"].includes(request.method)) {
-      headers.set("allow", "GET, HEAD");
-      throw new HttpError("Method not allowed.", 405);
-    }
-    const url = new URL(request.url);
-    const isOembed = url.pathname === "/oembed";
-    const activity = /^\/(?:api\/v1\/statuses|users\/[\w.-]+\/statuses)\/(\d{1,2500})$/.exec(url.pathname);
-    let target = url;
-    if (isOembed) {
-      try { target = new URL(url.searchParams.get("url") ?? ""); } catch { throw new HttpError("Invalid embed URL.", 400); }
-      if (target.origin !== url.origin) throw new HttpError("Invalid embed origin.", 400);
-    }
-    if (activity) {
-      const hex = BigInt(activity[1]!).toString(16);
-      const path = Buffer.from(hex.padStart(hex.length + hex.length % 2, "0"), "hex").toString();
-      if (!/^\/[tis]\//.test(path)) throw new HttpError("Invalid status ID.", 400);
-      target = new URL(path, url.origin);
-    }
-    const { post, source, id } = await loadPost(target, fetcher);
-    const media = post.media[0];
-    if (!isOembed && !activity && url.searchParams.get("direct") === "1") {
-      status = 302;
-      headers.set("location", (media?.video || media?.image)!);
-    } else {
-      headers.set("cache-control", "public, max-age=0, s-maxage=300, stale-while-revalidate=30");
-      const rendered = embed(post, source, target, id);
-      if (isOembed || activity) {
-        headers.set("content-type", "application/json");
-        body = JSON.stringify(activity ? rendered.activity : rendered.oembed);
-      } else {
-        headers.set("content-type", "text/html; charset=utf-8");
-        body = rendered.html;
+export function createHandler(fetcher: Fetcher = fetch, now: () => number = Date.now) {
+  const cached = createPostCache(now);
+  return async function handle(request: Request): Promise<Response> {
+    const headers = new Headers({ "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer" });
+    let body = "", status = 200;
+    try {
+      if (!["GET", "HEAD"].includes(request.method)) {
+        headers.set("allow", "GET, HEAD");
+        throw new HttpError("Method not allowed.", 405);
       }
+      const url = new URL(request.url);
+      const isOembed = url.pathname === "/oembed";
+      const activity = /^\/(?:api\/v1\/statuses|users\/[\w.-]+\/statuses)\/(\d{1,2500})$/.exec(url.pathname);
+      let target = url;
+      if (isOembed) {
+        try { target = new URL(url.searchParams.get("url") ?? ""); } catch { throw new HttpError("Invalid embed URL.", 400); }
+        if (target.origin !== url.origin) throw new HttpError("Invalid embed origin.", 400);
+      }
+      if (activity) {
+        const hex = BigInt(activity[1]!).toString(16);
+        const path = Buffer.from(hex.padStart(hex.length + hex.length % 2, "0"), "hex").toString();
+        if (!/^\/[tis]\//.test(path)) throw new HttpError("Invalid status ID.", 400);
+        target = new URL(path, url.origin);
+      }
+      const { post, source, id, expiresAt } = await loadPost(target, fetcher, cached);
+      const media = post.media[0];
+      if (!isOembed && !activity && url.searchParams.get("direct") === "1") {
+        status = 302;
+        headers.set("location", (media?.video || media?.image)!);
+      } else {
+        // A memory hit must not restart the CDN's five-minute freshness window.
+        const remaining = Math.max(0, Math.floor((expiresAt - now()) / 1000));
+        headers.set("cache-control", `public, max-age=0, s-maxage=${remaining}, stale-while-revalidate=30`);
+        const rendered = embed(post, source, target, id);
+        if (isOembed || activity) {
+          headers.set("content-type", "application/json");
+          body = JSON.stringify(activity ? rendered.activity : rendered.oembed);
+        } else {
+          headers.set("content-type", "text/html; charset=utf-8");
+          body = rendered.html;
+        }
+      }
+    } catch (error) {
+      status = error instanceof HttpError ? error.status : 502;
+      body = error instanceof HttpError ? error.message : "Source unavailable.";
+      headers.set("content-type", "text/plain; charset=utf-8");
+      headers.set("cache-control", "no-store");
     }
-  } catch (error) {
-    status = error instanceof HttpError ? error.status : 502;
-    body = error instanceof HttpError ? error.message : "Source unavailable.";
-    headers.set("content-type", "text/plain; charset=utf-8");
-    headers.set("cache-control", "no-store");
-  }
-  return new Response(request.method === "HEAD" ? null : body, { status, headers });
+    return new Response(request.method === "HEAD" ? null : body, { status, headers });
+  };
 }
+
+export const handle = createHandler();
